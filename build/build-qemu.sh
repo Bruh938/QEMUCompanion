@@ -69,6 +69,18 @@ build_glib() {
   ninja -C "$WORK/glib-build" install
 }
 
+build_slirp() {
+  # QEMU 11.x needs libslirp >= 4.9 (slirp_pollfds_fill_socket). Build upstream's tag statically into $PREFIX.
+  [ -f "$PREFIX/lib/libslirp.a" ] && return
+  local src="$WORK/libslirp"
+  [ -d "$src" ] || git clone --depth 1 --branch v4.9.1 https://gitlab.freedesktop.org/slirp/libslirp.git "$src"
+  export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig"
+  meson setup "$WORK/slirp-build" "$src" --cross-file "$WORK/android-arm64.cross" \
+    --prefix "$PREFIX" --default-library static
+  ninja -C "$WORK/slirp-build" install
+  nm "$PREFIX/lib/libslirp.a" | grep -q slirp_pollfds_fill_socket || { echo "libslirp too old"; exit 1; }
+}
+
 build_shm_shim() {
   # bionic has no shm_open/shm_unlink; QEMU's meson wants them (and a "librt"). Fake both.
   [ -f "$PREFIX/lib/librt.a" ] && return
@@ -132,6 +144,7 @@ install_into_project() {
 
 build_pixman
 build_glib
+build_slirp
 build_shm_shim
 build_qemu
 install_into_project
