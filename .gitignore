@@ -1,0 +1,8 @@
+*.iml
+.gradle/
+.idea/
+local.properties
+/app/build/
+/build/*
+!/build/build-qemu.sh
+!/build/README.md
