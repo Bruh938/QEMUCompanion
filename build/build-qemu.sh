@@ -27,7 +27,7 @@ FEATURE_MODE=${FEATURE_MODE:-auto}
 DENY=(vhost-net vhost-kernel vhost-user vhost-vdpa vhost-crypto vhost-user-blk-server vfio-user-server
       vduse-blk-export fuse linux-aio linux-io-uring seccomp cap-ng guest-agent modules plugins docs rust
       gtk sdl sdl-image opengl curses cocoa pa alsa jack pipewire oss sndio spice spice-protocol smartcard
-      u2f canokey nitro libusb usb-redir xen xen-pci-passthrough selinux numa rdma qom-cast-debug)
+      u2f canokey nitro usb-redir xen xen-pci-passthrough selinux numa rdma qom-cast-debug)
 BASE_FLAGS=()
 if [ "$FEATURE_MODE" = minimal ]; then
   BASE_FLAGS=(--without-default-features)
@@ -42,6 +42,10 @@ fi
 EXTRA_LIBS=${EXTRA_LIBS:-1}
 EXTRA_FLAGS=()
 if [ "$EXTRA_LIBS" = 1 ]; then EXTRA_FLAGS=(--enable-zstd --enable-bzip2 --enable-vnc-jpeg --enable-png); fi
+# GnuTLS (+GMP/nettle/libtasn1), libcurl, libusb, capstone, lzo. CRYPTO_LIBS=0 to skip.
+CRYPTO_LIBS=${CRYPTO_LIBS:-1}
+CRYPTO_FLAGS=()
+if [ "$CRYPTO_LIBS" = 1 ]; then CRYPTO_FLAGS=(--enable-gnutls --enable-capstone --enable-lzo --enable-curl --enable-libusb); fi
 GLIB_VER=2.82.5
 PIXMAN_VER=0.43.4
 
@@ -73,7 +77,14 @@ needs_exe_wrapper = true
 pkg_config_libdir = '$PREFIX/lib/pkgconfig'
 CROSS
 
-fetch() { [ -f "$WORK/$2" ] || wget -q -O "$WORK/$2" "$1"; }
+fetch() { # url archive-name ; validates the download so a bad (HTML) response is never cached
+  [ -f "$WORK/$2" ] && return
+  wget -q --tries=3 -O "$WORK/$2.tmp" "$1" || { rm -f "$WORK/$2.tmp"; echo "download failed: $1"; exit 1; }
+  if ! tar -tf "$WORK/$2.tmp" >/dev/null 2>&1; then
+    rm -f "$WORK/$2.tmp"; echo "bad download (not an archive): $1"; exit 1
+  fi
+  mv "$WORK/$2.tmp" "$WORK/$2"
+}
 
 build_pixman() {
   [ -f "$PREFIX/lib/libpixman-1.a" ] && return
@@ -157,10 +168,71 @@ PC
     -DPNG_SHARED=OFF -DPNG_STATIC=ON -DPNG_TESTS=OFF -DPNG_TOOLS=OFF
 }
 
+# Generic autotools static-lib builder (cross-compiling with the NDK clang).
+autotools_dep() { # name url archive srcdir [configure args...]
+  local name=$1 url=$2 ar=$3 srcdir=$4; shift 4
+  [ -f "$WORK/.done-$name" ] && return
+  fetch "$url" "$ar"
+  tar -C "$WORK" -xf "$WORK/$ar"
+  rm -rf "$WORK/$name-build"; mkdir -p "$WORK/$name-build"
+  ( cd "$WORK/$name-build"
+    export CC="$CC" CXX="$CXX" AR="$TB/llvm-ar" RANLIB="$TB/llvm-ranlib" STRIP="$TB/llvm-strip" NM="$TB/llvm-nm"
+    export CFLAGS="-O2 -fPIC" CPPFLAGS="-I$PREFIX/include" LDFLAGS="-L$PREFIX/lib"
+    export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig"
+    "$WORK/$srcdir/configure" --host=aarch64-linux-android --prefix="$PREFIX" --enable-static --disable-shared "$@"
+    make -j"$JOBS"
+    make install )
+  touch "$WORK/.done-$name"
+}
+
+# Static-only libs built with autotools list their dependencies in Libs.private/Requires.private,
+# which plain pkg-config calls ignore. Merge them into the public fields (idempotent).
+fix_static_pc() {
+  local f="$PREFIX/lib/pkgconfig/$1.pc"
+  [ -f "$f" ] || return 0
+  grep -q '^# static-merged' "$f" && return 0
+  local lp rp
+  lp=$(sed -n 's/^Libs\.private:[[:space:]]*//p' "$f")
+  rp=$(sed -n 's/^Requires\.private:[[:space:]]*//p' "$f")
+  sed -i "s|^Libs:.*|& $lp|" "$f"
+  if [ -n "$rp" ]; then
+    if grep -q '^Requires:' "$f"; then sed -i "s|^Requires:.*|& , $rp|" "$f"
+    else echo "Requires: $rp" >> "$f"; fi
+  fi
+  echo '# static-merged' >> "$f"
+}
+
+build_crypto_libs() {
+  cmake_dep capstone https://github.com/capstone-engine/capstone/archive/refs/tags/5.0.3.tar.gz capstone.tgz capstone-5.0.3 \
+    -DCAPSTONE_BUILD_TESTS=OFF -DCAPSTONE_BUILD_CSTOOL=OFF
+  cmake_dep lzo https://www.oberhumer.com/opensource/lzo/download/lzo-2.10.tar.gz lzo.tgz lzo-2.10 \
+    -DENABLE_STATIC=ON -DENABLE_SHARED=OFF
+  autotools_dep libusb https://github.com/libusb/libusb/releases/download/v1.0.27/libusb-1.0.27.tar.bz2 libusb.tbz libusb-1.0.27 \
+    --disable-udev
+  autotools_dep gmp https://ftp.gnu.org/gnu/gmp/gmp-6.3.0.tar.xz gmp.txz gmp-6.3.0
+  autotools_dep nettle https://ftp.gnu.org/gnu/nettle/nettle-3.10.tar.gz nettle.tgz nettle-3.10 \
+    --disable-documentation
+  autotools_dep libtasn1 https://ftp.gnu.org/gnu/libtasn1/libtasn1-4.19.0.tar.gz libtasn1.tgz libtasn1-4.19.0 \
+    --disable-doc
+  local gv  # find the newest 3.8.x tarball instead of hardcoding a version that may not exist
+  gv=$(wget -qO- https://www.gnupg.org/ftp/gcrypt/gnutls/v3.8/ | grep -o 'gnutls-3\.8\.[0-9]*\.tar\.xz' | sort -uV | tail -1 || true)
+  [ -n "$gv" ] || { echo "could not find a GnuTLS 3.8.x tarball at gnupg.org"; exit 1; }
+  gv=${gv%.tar.xz}; echo "using $gv"
+  autotools_dep gnutls "https://www.gnupg.org/ftp/gcrypt/gnutls/v3.8/$gv.tar.xz" gnutls.txz "$gv" \
+    --without-p11-kit --with-included-unistring --without-idn --disable-doc --disable-tests --disable-tools \
+    --disable-guile --disable-libdane --disable-cxx --disable-nls --disable-openssl-compatibility
+  for p in nettle hogweed libtasn1 gnutls libusb-1.0; do fix_static_pc "$p"; done
+  autotools_dep curl https://curl.se/download/curl-8.10.1.tar.xz curl.txz curl-8.10.1 \
+    --with-gnutls --without-openssl --with-ca-path=/system/etc/security/cacerts \
+    --without-libpsl --without-nghttp2 --without-brotli --without-zstd \
+    --disable-ldap --disable-ldaps --disable-docs --disable-manual
+  fix_static_pc libcurl
+}
+
 build_shm_shim() {
   # bionic has no shm_open/shm_unlink; QEMU's meson wants them (and a "librt"). Fake both.
   mkdir -p "$PREFIX/include" "$PREFIX/lib"
-  cat > "$PREFIX/include/shm_shim.h" <<'H'
+  cat > "$PREFIX/include/shm_shim.h.new" <<'H'
 #pragma once
 #include <sys/types.h>
 int shm_open(const char *name, int oflag, mode_t mode);
@@ -171,6 +243,12 @@ int shm_unlink(const char *name);
 #undef st_mtime_nsec
 #undef st_ctime_nsec
 H
+  # Only replace the header if it changed: a new mtime would make ninja rebuild everything.
+  if cmp -s "$PREFIX/include/shm_shim.h.new" "$PREFIX/include/shm_shim.h" 2>/dev/null; then
+    rm -f "$PREFIX/include/shm_shim.h.new"
+  else
+    mv "$PREFIX/include/shm_shim.h.new" "$PREFIX/include/shm_shim.h"
+  fi
   [ -f "$PREFIX/lib/librt.a" ] && return
   cat > "$WORK/shm_shim.c" <<'C'
 #define _GNU_SOURCE
@@ -200,7 +278,7 @@ build_qemu() {
   "$QEMU_SRC/configure" \
     --prefix=/opt/qemu --cross-prefix=aarch64-linux-android- --cpu=aarch64 \
     --cc="$CC" --cxx="$CXX" --host-cc=cc \
-    "${TL_ARG[@]}" "${FORMAT_FLAGS[@]}" "${EXTRA_FLAGS[@]}" \
+    "${TL_ARG[@]}" "${FORMAT_FLAGS[@]}" "${EXTRA_FLAGS[@]}" "${CRYPTO_FLAGS[@]}" \
     "${BASE_FLAGS[@]}" \
     --enable-system --enable-tools --enable-tcg --enable-kvm --enable-slirp --enable-vnc --enable-pixman \
     --disable-docs --disable-werror --disable-gio \
@@ -233,6 +311,7 @@ build_pixman
 build_glib
 build_slirp
 if [ "$EXTRA_LIBS" = 1 ]; then build_extra_libs; fi
+if [ "$CRYPTO_LIBS" = 1 ]; then build_crypto_libs; fi
 build_shm_shim
 build_qemu
 install_into_project
